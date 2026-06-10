@@ -1,0 +1,27 @@
+:root {
+  /* ===== Brand colors ===== */
+  --color-primary: #0077b6;     /* ocean blue */
+  --color-secondary: #00b4d8;   /* lighter aqua accent */
+  --color-accent: #90e0ef;      /* soft turquoise */
+  --color-background: #f8f9fa;  /* off white */
+  --color-surface: #ffffff;     /* white cards */
+  --color-text: #1a1a1a;        /* main dark text */
+  --color-muted: #6c757d;       /* gray subtitles */
+
+  /* ===== Font settings ===== */
+  --font-main: 'Poppins', 'Segoe UI', sans-serif;
+  --font-heading: 'Montserrat', 'Segoe UI', sans-serif;
+
+  /* ===== Sizing and spacing ===== */
+  --max-width: 1200px;
+  --radius: 12px;
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 16px;
+  --spacing-lg: 32px;
+  --spacing-xl: 64px;
+
+  /* ===== Shadows ===== */
+  --shadow-soft: 0 2px 10px rgba(0, 0, 0, 0.08);
+  --shadow-medium: 0 4px 20px rgba(0, 0, 0, 0.12);
+}

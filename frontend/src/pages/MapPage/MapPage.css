@@ -1,0 +1,5 @@
+.map-page {
+  width: 100%;
+  height: calc(100dvh - var(--nav-h));
+  min-height: 500px;
+}

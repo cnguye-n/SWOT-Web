@@ -1,351 +1,975 @@
 #!/usr/bin/env python3
+"""Diagnosable SWOT L3 swath -> GeoTIFF/COG conversion.
+
+This script follows the same staged logic as SWOTPass_FigureGenerator.ipynb:
+
+    1. open and inspect the NetCDF
+    2. load native 2-D longitude/latitude/SSHA arrays
+    3. normalize longitude and units
+    4. apply explicit quality control
+    5. clip by masking, without reshaping the native swath
+    6. diagnose native spacing and mapped nadir positions
+    7. preview the native swath
+    8. resample with pyresample nearest-neighbour
+    9. preview and validate the output raster
+    10. write GeoTIFF/COG, a nadir GeoJSON vector, and diagnostics
+
+Nearest-neighbour resampling copies existing source values. It does not blend,
+smooth, or linearly interpolate SSHA values.
 """
-swot_to_cog.py
 
-Convert SWOT L3 LR SSH NetCDF swath data into a Cloud Optimized GeoTIFF.
-
-This version is intentionally minimal-processing.
-
-Pipeline:
-    SWOT NetCDF
-    -> read latitude, longitude, SSHA
-    -> convert longitude to -180 to 180
-    -> optionally mask using quality_flag == 0
-    -> optionally clip to a bounding box
-    -> directly place real SWOT values onto a regular raster grid
-    -> leave empty cells as nodata
-    -> write COG to frontend/public/data
-
-Important:
-    This script does NOT interpolate.
-    This script does NOT fill holes.
-    This script does NOT smooth the data.
-
-Why?
-    For a science-style visualization, we want to avoid inventing values
-    between real SWOT measurements.
-
-Example for Jacob's Gulf Stream AOI:
-
-    python scripts/swot_to_cog.py \
-      ~/Documents/MOSAICS-2026/SWOT-Data/JACOBS_UNSMOOTHED_FILE.nc \
-      --variable ssha_unfiltered \
-      --output frontend/public/data/swot_pass_91_unsmoothed_ssha_unfiltered_raw_cog.tif \
-      --resolution-deg 0.0025 \
-      --bbox -82 23 -69 42
-
-Bounding box order:
-    --bbox WEST SOUTH EAST NORTH
-
-Jacob gave:
-    S, W, N, E = 23, -82, 42, -69
-
-For this script:
-    --bbox -82 23 -69 42
-"""
+from __future__ import annotations
 
 import argparse
+import json
+import math
+import re
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterable
 
+import matplotlib.pyplot as plt
 import numpy as np
-import xarray as xr
 import rasterio
+import xarray as xr
+from pyresample import geometry, kd_tree
+from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
-from rasterio.shutil import copy as rio_copy
+
+NODATA = -9999.0
+EARTH_RADIUS_M = 6_371_008.8
 
 
-def lon_360_to_180(lon):
+@dataclass
+class SwotArrays:
+    """Native SWOT arrays and optional mapped-nadir information."""
+
+    longitude: np.ndarray
+    latitude: np.ndarray
+    values: np.ndarray
+    quality_flag: np.ndarray | None
+    cross_track_distance: np.ndarray | None
+    i_num_line: np.ndarray | None
+    i_num_pixel: np.ndarray | None
+    nadir_lon: np.ndarray | None
+    nadir_lat: np.ndarray | None
+    nadir_values: np.ndarray | None
+    nadir_source_lines: np.ndarray | None
+    nadir_source_pixels: np.ndarray | None
+    units: str
+
+
+@dataclass
+class RasterResult:
+    """Resampled raster and the grid information used to create it."""
+
+    data: np.ndarray
+    bbox: tuple[float, float, float, float]
+    width: int
+    height: int
+    spacing_m: float
+    radius_m: float
+
+
+def parse_quality_values(text: str) -> tuple[int, ...]:
+    """Parse a comma-separated quality list such as '0,3'."""
+    try:
+        values = tuple(sorted({int(part.strip()) for part in text.split(",") if part.strip()}))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Quality values must be comma-separated integers.") from exc
+    if not values:
+        raise argparse.ArgumentTypeError("At least one quality value is required.")
+    return values
+
+
+def wrap_longitudes(longitude: np.ndarray) -> np.ndarray:
+    """Convert longitude to [-180, 180)."""
+    return ((longitude + 180.0) % 360.0) - 180.0
+
+
+def open_swot_dataset(path: Path) -> xr.Dataset:
+    """Open a SWOT NetCDF with scale factors and fill values decoded."""
+    return xr.open_dataset(path, mask_and_scale=True, decode_times=False)
+
+
+def inspect_dataset(ds: xr.Dataset, variable: str) -> dict[str, Any]:
+    """Return and print a compact dataset inventory before processing."""
+    required = ["longitude", "latitude", variable]
+    missing = [name for name in required if name not in ds]
+    if missing:
+        raise KeyError(f"Missing required variables: {missing}. Available: {list(ds.variables)}")
+
+    important = [
+        "longitude", "latitude", variable, "quality_flag",
+        "cross_track_distance", "i_num_line", "i_num_pixel", "time",
+    ]
+    inventory: dict[str, Any] = {
+        "dimensions": {name: int(size) for name, size in ds.sizes.items()},
+        "variables": {},
+    }
+
+    print("\n[1/10] Dataset inspection")
+    print("Dimensions:", inventory["dimensions"])
+    for name in important:
+        if name not in ds:
+            continue
+        da = ds[name]
+        item = {
+            "shape": list(da.shape),
+            "dtype": str(da.dtype),
+            "units": str(da.attrs.get("units", "")),
+        }
+        inventory["variables"][name] = item
+        print(f"  {name:22s} shape={str(da.shape):16s} dtype={str(da.dtype):10s} units={item['units']}")
+    return inventory
+
+
+def extract_mapped_nadir(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    values: np.ndarray,
+    i_num_line: np.ndarray | None,
+    i_num_pixel: np.ndarray | None,
+) -> tuple[
+    np.ndarray | None, np.ndarray | None, np.ndarray | None,
+    np.ndarray | None, np.ndarray | None,
+]:
+    """Map L3 nadir indices back to the 2-D L3 grid.
+
+    L3 Basic/Expert files store the nadir observations in the same 2-D image
+    as the KaRIn swath. ``i_num_line`` and ``i_num_pixel`` identify the grid
+    cell associated with each original 1-D nadir observation.
+
+    Arrays keep their original ``num_nadir`` length. Invalid index entries are
+    represented by NaN so a missing observation creates a break in the line.
     """
-    Convert longitude from 0–360 degrees to -180–180 degrees.
+    if i_num_line is None or i_num_pixel is None:
+        return None, None, None, None, None
 
-    Example:
-        278 degrees becomes -82 degrees.
+    lines = np.asarray(i_num_line).astype(np.int64, copy=False)
+    pixels = np.asarray(i_num_pixel).astype(np.int64, copy=False)
+    if lines.shape != pixels.shape:
+        raise ValueError("i_num_line and i_num_pixel must have the same shape.")
 
-    Web maps usually expect longitude in -180 to 180 format.
-    """
-    return ((lon + 180) % 360) - 180
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Convert SWOT NetCDF SSHA swath into a Cloud Optimized GeoTIFF."
+    ok = (
+        (lines >= 0) & (lines < longitude.shape[0])
+        & (pixels >= 0) & (pixels < longitude.shape[1])
     )
 
-    parser.add_argument(
-        "file",
-        help="Path to SWOT NetCDF file.",
-    )
+    nadir_lon = np.full(lines.shape, np.nan, dtype=np.float64)
+    nadir_lat = np.full(lines.shape, np.nan, dtype=np.float64)
+    nadir_values = np.full(lines.shape, np.nan, dtype=np.float64)
+    nadir_lon[ok] = longitude[lines[ok], pixels[ok]]
+    nadir_lat[ok] = latitude[lines[ok], pixels[ok]]
+    nadir_values[ok] = values[lines[ok], pixels[ok]]
 
-    parser.add_argument(
-        "--variable",
-        default="ssha_unfiltered",
-        help="Variable to export, e.g. ssha_unfiltered, ssha_filtered, or ssha_unedited.",
-    )
+    return nadir_lon, nadir_lat, nadir_values, lines, pixels
 
-    parser.add_argument(
-        "--output",
-        default="frontend/public/data/swot_ssha_cog.tif",
-        help="Output COG GeoTIFF path.",
-    )
 
-    parser.add_argument(
-        "--resolution-deg",
-        type=float,
-        default=0.0025,
-        help=(
-            "Output raster resolution in degrees. "
-            "Smaller = finer-looking raster but larger/slower file. "
-            "0.0025 is roughly 250 m near the equator. "
-            "0.005 is roughly 500 m near the equator."
-        ),
-    )
+def load_native_arrays(ds: xr.Dataset, variable: str) -> SwotArrays:
+    """Load native arrays, normalize longitudes, and reconstruct mapped nadir."""
+    print("\n[2/10] Loading native SWOT arrays")
+    longitude = wrap_longitudes(np.asarray(ds["longitude"].values, dtype=np.float64))
+    latitude = np.asarray(ds["latitude"].values, dtype=np.float64)
+    values = np.asarray(ds[variable].values, dtype=np.float64)
 
-    parser.add_argument(
-        "--bbox",
-        nargs=4,
-        type=float,
-        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
-        help=(
-            "Optional bounding box clip in WEST SOUTH EAST NORTH order. "
-            "Example for Jacob Gulf Stream AOI: --bbox -82 23 -69 42"
-        ),
-    )
-
-    parser.add_argument(
-        "--quality-mask",
-        action="store_true",
-        help=(
-            "Use only quality_flag == 0 pixels if quality_flag exists. "
-            "If omitted, all finite SSHA values are used."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    nc_path = Path(args.file).expanduser().resolve()
-    output_cog = Path(args.output).expanduser().resolve()
-    output_cog.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_tif = output_cog.with_name(output_cog.stem + "_temp.tif")
-
-    print(f"Opening NetCDF: {nc_path}")
-
-    ds = xr.open_dataset(nc_path, mask_and_scale=True)
-
-    if args.variable not in ds:
+    if longitude.shape != latitude.shape or longitude.shape != values.shape:
         raise ValueError(
-            f"Variable '{args.variable}' not found. "
-            f"Available variables: {list(ds.data_vars)}"
+            f"longitude, latitude, and {variable} must share one 2-D shape; "
+            f"got {longitude.shape}, {latitude.shape}, {values.shape}."
         )
 
-    if "latitude" not in ds or "longitude" not in ds:
-        raise ValueError(
-            "This script expected variables named 'latitude' and 'longitude'. "
-            "Open the NetCDF and inspect variable names if this fails."
-        )
+    quality = np.asarray(ds["quality_flag"].values) if "quality_flag" in ds else None
+    cross_track = np.asarray(ds["cross_track_distance"].values) if "cross_track_distance" in ds else None
+    i_line = np.asarray(ds["i_num_line"].values) if "i_num_line" in ds else None
+    i_pixel = np.asarray(ds["i_num_pixel"].values) if "i_num_pixel" in ds else None
+    (
+        nadir_lon, nadir_lat, nadir_values,
+        nadir_source_lines, nadir_source_pixels,
+    ) = extract_mapped_nadir(longitude, latitude, values, i_line, i_pixel)
 
-    print(f"Using variable: {args.variable}")
+    print("Native grid shape:", values.shape)
+    if cross_track is not None and cross_track.ndim == 1:
+        center_column = int(np.nanargmin(np.abs(cross_track)))
+        print("Cross-track center column:", center_column)
+        print("Center distance:", float(cross_track[center_column]), ds["cross_track_distance"].attrs.get("units", ""))
+    if nadir_lon is not None:
+        print("Mapped nadir observations:", int(np.count_nonzero(np.isfinite(nadir_lon) & np.isfinite(nadir_lat))))
 
-    # Read coordinates and data.
-    lat = ds["latitude"].values
-    lon = ds["longitude"].values
-    data = ds[args.variable].values
+    return SwotArrays(
+        longitude=longitude,
+        latitude=latitude,
+        values=values,
+        quality_flag=quality,
+        cross_track_distance=cross_track,
+        i_num_line=i_line,
+        i_num_pixel=i_pixel,
+        nadir_lon=nadir_lon,
+        nadir_lat=nadir_lat,
+        nadir_values=nadir_values,
+        nadir_source_lines=nadir_source_lines,
+        nadir_source_pixels=nadir_source_pixels,
+        units=str(ds[variable].attrs.get("units", "")),
+    )
 
-    # Convert longitudes into web-map format.
-    lon = lon_360_to_180(lon)
 
-    # Optional quality filtering.
-    # For SWOT L3 Expert/Unsmoothed, quality_flag usually exists.
-    # quality_flag == 0 means valid/good.
-    if args.quality_mask:
-        if "quality_flag" in ds:
-            print("Applying quality_flag == 0 mask...")
-            quality_flag = ds["quality_flag"].values
-            data = np.where(quality_flag == 0, data, np.nan)
-        else:
-            print("Warning: --quality-mask was requested, but quality_flag was not found.")
-
-    # Remove extreme values for safety.
-    # This does not control the color ramp.
-    # The React map controls color range separately.
-    data = np.where((data > -2.0) & (data < 2.0), data, np.nan)
-
-    # Flatten the SWOT swath arrays.
-    lon_flat = lon.ravel()
-    lat_flat = lat.ravel()
-    data_flat = data.ravel()
-
-    # Keep only real finite values.
+def build_valid_mask(
+    arrays: SwotArrays,
+    quality_values: tuple[int, ...],
+    use_quality_mask: bool,
+    value_min: float | None,
+    value_max: float | None,
+) -> np.ndarray:
+    """Build one explicit source-validity mask for all later stages."""
+    print("\n[3/10] Applying source quality control")
     valid = (
-        np.isfinite(lon_flat)
-        & np.isfinite(lat_flat)
-        & np.isfinite(data_flat)
+        np.isfinite(arrays.longitude)
+        & np.isfinite(arrays.latitude)
+        & np.isfinite(arrays.values)
+        & (arrays.latitude >= -90.0)
+        & (arrays.latitude <= 90.0)
     )
 
-    # Optional bbox clip.
-    if args.bbox is not None:
-        west_clip, south_clip, east_clip, north_clip = args.bbox
+    if use_quality_mask:
+        if arrays.quality_flag is None:
+            print("Warning: quality mask requested, but quality_flag is unavailable.")
+        else:
+            valid &= np.isin(arrays.quality_flag, quality_values)
+            print("Accepted quality flags:", quality_values)
 
-        print("Applying bounding box clip:")
-        print(f"  west:  {west_clip}")
-        print(f"  south: {south_clip}")
-        print(f"  east:  {east_clip}")
-        print(f"  north: {north_clip}")
+    if value_min is not None:
+        valid &= arrays.values >= value_min
+    if value_max is not None:
+        valid &= arrays.values <= value_max
 
-        bbox_mask = (
-            (lon_flat >= west_clip)
-            & (lon_flat <= east_clip)
-            & (lat_flat >= south_clip)
-            & (lat_flat <= north_clip)
-        )
+    print(f"Valid native cells: {int(valid.sum()):,} / {valid.size:,}")
+    return valid
 
-        valid = valid & bbox_mask
 
-    lon_valid = lon_flat[valid]
-    lat_valid = lat_flat[valid]
-    data_valid = data_flat[valid]
+def normalize_bbox(bbox: Iterable[float]) -> tuple[float, float, float, float]:
+    west, south, east, north = map(float, bbox)
+    if not (-180 <= west < east <= 180):
+        raise ValueError("BBox must satisfy -180 <= west < east <= 180.")
+    if not (-90 <= south < north <= 90):
+        raise ValueError("BBox must satisfy -90 <= south < north <= 90.")
+    return west, south, east, north
 
-    if len(data_valid) == 0:
-        raise ValueError(
-            f"No valid data values found for variable {args.variable}. "
-            "Check the variable name, bbox, and quality mask."
-        )
 
-    # Use bounds of the valid data after clipping.
-    west = float(np.nanmin(lon_valid))
-    east = float(np.nanmax(lon_valid))
-    south = float(np.nanmin(lat_valid))
-    north = float(np.nanmax(lat_valid))
+def derive_bbox(longitude: np.ndarray, latitude: np.ndarray, valid: np.ndarray, pad_deg: float = 0.05) -> tuple[float, float, float, float]:
+    """Derive output bounds from valid native cells."""
+    lon = longitude[valid]
+    lat = latitude[valid]
+    if lon.size == 0:
+        raise ValueError("No valid source coordinates remain.")
+    if np.nanmax(lon) - np.nanmin(lon) > 180:
+        raise ValueError("Pass crosses the antimeridian; provide a regional --bbox.")
+    return (
+        max(-180.0, float(np.nanmin(lon)) - pad_deg),
+        max(-90.0, float(np.nanmin(lat)) - pad_deg),
+        min(180.0, float(np.nanmax(lon)) + pad_deg),
+        min(90.0, float(np.nanmax(lat)) + pad_deg),
+    )
 
-    print("Output data bounds:")
-    print(f"  west:  {west}")
-    print(f"  east:  {east}")
-    print(f"  south: {south}")
-    print(f"  north: {north}")
 
-    resolution = args.resolution_deg
-
-    width = int(np.ceil((east - west) / resolution))
-    height = int(np.ceil((north - south) / resolution))
-
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid output raster size: {width} x {height}")
-
-    print(f"Output raster size: {width} x {height}")
-    print(f"Resolution: {resolution} degrees")
-
-    print("Directly rasterizing SWOT points without interpolation or hole filling...")
-
-    # Start with an empty raster.
-    # Every cell remains NaN unless a real SWOT measurement falls into it.
-    grid_data = np.full((height, width), np.nan, dtype="float32")
-
-    # Convert each SWOT lon/lat point into a raster column/row.
-    #
-    # Column:
-    #   west -> 0
-    #   east -> width - 1
-    #
-    # Row for now:
-    #   south -> 0
-    #   north -> height - 1
-    #
-    # We flip the raster later because GeoTIFF rows are stored north-to-south.
-    col = np.floor((lon_valid - west) / resolution).astype(int)
-    row = np.floor((lat_valid - south) / resolution).astype(int)
-
+def apply_bbox_mask(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    valid: np.ndarray,
+    bbox: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Clip by masking native cells; do not reshape the swath."""
+    print("\n[4/10] Applying geographic mask")
+    west, south, east, north = bbox
     inside = (
-        (col >= 0)
-        & (col < width)
-        & (row >= 0)
-        & (row < height)
+        (longitude >= west) & (longitude <= east)
+        & (latitude >= south) & (latitude <= north)
     )
+    clipped = valid & inside
+    rows = np.where(np.any(clipped, axis=1))[0]
+    print("Output bbox:", bbox)
+    print("Native rows intersecting bbox:", int(rows.size))
+    print("Valid cells inside bbox:", int(clipped.sum()))
+    if not np.any(clipped):
+        raise ValueError("No valid source cells intersect the output bbox.")
+    return clipped
 
-    col = col[inside]
-    row = row[inside]
-    values = data_valid[inside]
 
-    print(f"Valid SWOT points inside raster: {len(values)}")
+def haversine_m(lon1: np.ndarray, lat1: np.ndarray, lon2: np.ndarray, lat2: np.ndarray) -> np.ndarray:
+    """Great-circle distance in meters."""
+    lon1r, lat1r, lon2r, lat2r = map(np.deg2rad, (lon1, lat1, lon2, lat2))
+    dlon = lon2r - lon1r
+    dlat = lat2r - lat1r
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_M * np.arcsin(np.minimum(1.0, np.sqrt(a)))
 
-    if len(values) == 0:
-        raise ValueError("No SWOT points landed inside the output raster.")
 
-    # If multiple real SWOT points land in the same raster cell,
-    # average them. This is NOT interpolation; it only combines real
-    # measurements that occupy the same output cell.
-    sum_grid = np.zeros((height, width), dtype="float64")
-    count_grid = np.zeros((height, width), dtype="int32")
+def estimate_source_spacing_m(longitude: np.ndarray, latitude: np.ndarray, valid: np.ndarray) -> float:
+    """Estimate native posting from valid along- and across-track neighbors."""
+    print("\n[5/10] Diagnosing native spacing")
+    samples: list[np.ndarray] = []
 
-    np.add.at(sum_grid, (row, col), values)
-    np.add.at(count_grid, (row, col), 1)
+    pairs = [
+        ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+        ((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+    ]
+    for first, second in pairs:
+        pair_valid = valid[first] & valid[second]
+        if np.any(pair_valid):
+            distances = haversine_m(
+                longitude[first][pair_valid], latitude[first][pair_valid],
+                longitude[second][pair_valid], latitude[second][pair_valid],
+            )
+            samples.append(distances)
 
-    has_data = count_grid > 0
-    grid_data[has_data] = (sum_grid[has_data] / count_grid[has_data]).astype("float32")
+    if not samples:
+        raise ValueError("Could not estimate source spacing.")
+    distances = np.concatenate(samples)
+    distances = distances[np.isfinite(distances) & (distances > 0)]
+    cutoff = np.nanpercentile(distances, 75)
+    typical = distances[distances <= cutoff]
+    spacing = float(np.nanmedian(typical))
+    print(f"Estimated typical native spacing: {spacing:,.1f} m")
+    return spacing
 
-    filled_cells = int(np.count_nonzero(has_data))
-    total_cells = int(height * width)
-    print(f"Filled raster cells: {filled_cells} / {total_cells}")
 
-    # GeoTIFF rows must go north-to-south.
-    # Our row calculation was south-to-north, so flip vertically.
-    grid_data = np.flipud(grid_data)
+def build_target_area(
+    bbox: tuple[float, float, float, float],
+    resolution_deg: float,
+) -> tuple[geometry.AreaDefinition, int, int]:
+    """Build a regular EPSG:4326 target area."""
+    west, south, east, north = bbox
+    width = max(1, math.ceil((east - west) / resolution_deg))
+    height = max(1, math.ceil((north - south) / resolution_deg))
+    area = geometry.AreaDefinition(
+        "swot_target", "SWOT swath output", "epsg4326", "EPSG:4326",
+        width, height, (west, south, east, north),
+    )
+    return area, width, height
 
-    nodata = -9999.0
-    grid_data = np.where(np.isfinite(grid_data), grid_data, nodata).astype("float32")
 
-    transform = from_bounds(west, south, east, north, width, height)
+def resample_swath_nearest(
+    arrays: SwotArrays,
+    valid: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    resolution_deg: float,
+    radius_m: float | None,
+    epsilon: float,
+) -> RasterResult:
+    """Nearest-neighbour swath resampling with an explicit physical radius."""
+    print("\n[6/10] Resampling native swath")
+    spacing = estimate_source_spacing_m(arrays.longitude, arrays.latitude, valid)
+    radius = float(radius_m) if radius_m is not None else 1.5 * spacing
+    if radius <= 0:
+        raise ValueError("radius_m must be positive.")
 
-    print(f"Writing temporary GeoTIFF: {temp_tif}")
+    area, width, height = build_target_area(bbox, resolution_deg)
+    source = geometry.SwathDefinition(lons=arrays.longitude, lats=arrays.latitude)
+    masked_values = np.ma.array(arrays.values, mask=~valid)
 
-    with rasterio.open(
-        temp_tif,
-        "w",
-        driver="GTiff",
-        height=height,
-        width=width,
-        count=1,
-        dtype="float32",
-        crs="EPSG:4326",
-        transform=transform,
-        nodata=nodata,
-        tiled=True,
-        blockxsize=256,
-        blockysize=256,
-        compress="deflate",
-        predictor=2,
-    ) as dst:
-        dst.write(grid_data, 1)
+    print(f"Search radius: {radius:,.1f} m")
+    print(f"Output grid: {width:,} x {height:,} at {resolution_deg} degrees")
+    result = kd_tree.resample_nearest(
+        source_geo_def=source,
+        data=masked_values,
+        target_geo_def=area,
+        radius_of_influence=radius,
+        epsilon=epsilon,
+        fill_value=None,
+        reduce_data=True,
+    )
+    data = np.asarray(np.ma.filled(result, np.nan), dtype=np.float32)
+    print(f"Finite output pixels: {int(np.count_nonzero(np.isfinite(data))):,}")
+    return RasterResult(data, bbox, width, height, spacing, radius)
 
-        dst.update_tags(
-            variable=args.variable,
-            source_file=nc_path.name,
-            time_start=str(ds.attrs.get("time_coverage_start", "")),
-            time_end=str(ds.attrs.get("time_coverage_end", "")),
-            units=ds[args.variable].attrs.get("units", "m"),
-            product=ds.attrs.get("title", "SWOT L3 LR SSH"),
-            doi=ds.attrs.get("doi", ""),
-            bbox=str(args.bbox) if args.bbox is not None else "",
-            resolution_deg=str(args.resolution_deg),
-            quality_mask=str(args.quality_mask),
-            processing="direct_raster_no_interpolation_no_hole_filling",
+
+def subset_nadir_for_bbox(arrays: SwotArrays, bbox: tuple[float, float, float, float]) -> tuple[np.ndarray, np.ndarray]:
+    """Return valid mapped-nadir positions within the selected bbox."""
+    if arrays.nadir_lon is None or arrays.nadir_lat is None:
+        return np.array([]), np.array([])
+    west, south, east, north = bbox
+    ok = (
+        np.isfinite(arrays.nadir_lon) & np.isfinite(arrays.nadir_lat)
+        & (arrays.nadir_lon >= west) & (arrays.nadir_lon <= east)
+        & (arrays.nadir_lat >= south) & (arrays.nadir_lat <= north)
+    )
+    return arrays.nadir_lon[ok], arrays.nadir_lat[ok]
+
+
+def parse_cycle_pass_from_name(path: Path) -> tuple[str | None, str | None]:
+    """Extract three-digit cycle and pass identifiers from a SWOT filename."""
+    match = re.search(r"_(\d{3})_(\d{3})_\d{8}T", path.name)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def load_land_geometry(path: Path):
+    """Load and union a polygon land dataset for optional nadir clipping.
+
+    This import is intentionally lazy. GeoPandas/Shapely are only required
+    when ``--land-shapefile`` is supplied.
+    """
+    try:
+        import geopandas as gpd
+    except ImportError as exc:
+        raise RuntimeError(
+            "--land-shapefile requires geopandas and shapely."
+        ) from exc
+
+    land = gpd.read_file(path)
+    if land.empty:
+        raise ValueError(f"Land polygon file contains no features: {path}")
+    if land.crs is not None and land.crs.to_epsg() != 4326:
+        land = land.to_crs("EPSG:4326")
+    return land.geometry.union_all()
+
+
+def build_nadir_valid_mask(
+    arrays: SwotArrays,
+    bbox: tuple[float, float, float, float],
+    value_min: float | None,
+    value_max: float | None,
+    land_geometry=None,
+) -> np.ndarray:
+    """Select mapped nadir observations for the vector line.
+
+    Important: the KaRIn ``quality_flag`` is not applied here. In L3
+    Basic/Expert products the mapped center-gap cells can carry the KaRIn
+    ``no_data`` flag even when a finite nadir observation is present.
+    """
+    if arrays.nadir_lon is None or arrays.nadir_lat is None or arrays.nadir_values is None:
+        return np.array([], dtype=bool)
+
+    west, south, east, north = bbox
+    valid = (
+        np.isfinite(arrays.nadir_lon)
+        & np.isfinite(arrays.nadir_lat)
+        & np.isfinite(arrays.nadir_values)
+        & (arrays.nadir_lon >= west) & (arrays.nadir_lon <= east)
+        & (arrays.nadir_lat >= south) & (arrays.nadir_lat <= north)
+    )
+    if value_min is not None:
+        valid &= arrays.nadir_values >= value_min
+    if value_max is not None:
+        valid &= arrays.nadir_values <= value_max
+
+    if land_geometry is not None and np.any(valid):
+        from shapely.geometry import Point
+
+        valid_indices = np.where(valid)[0]
+        on_land = np.array([
+            land_geometry.covers(Point(float(arrays.nadir_lon[i]), float(arrays.nadir_lat[i])))
+            for i in valid_indices
+        ])
+        valid[valid_indices[on_land]] = False
+
+    return valid
+
+
+def split_nadir_segments(
+    longitude: np.ndarray,
+    latitude: np.ndarray,
+    valid: np.ndarray,
+    max_gap_km: float,
+) -> list[list[list[float]]]:
+    """Split valid nadir points into LineString coordinate sequences.
+
+    A segment is broken by an invalid point, by clipping at the bbox/land, or
+    when consecutive observations are farther apart than ``max_gap_km``.
+    """
+    if max_gap_km <= 0:
+        raise ValueError("--nadir-max-gap-km must be positive.")
+
+    segments: list[list[list[float]]] = []
+    current: list[list[float]] = []
+    previous_index: int | None = None
+
+    for index in range(longitude.size):
+        if not valid[index]:
+            if len(current) >= 2:
+                segments.append(current)
+            current = []
+            previous_index = None
+            continue
+
+        if previous_index is not None:
+            gap_m = float(haversine_m(
+                np.array([longitude[previous_index]]),
+                np.array([latitude[previous_index]]),
+                np.array([longitude[index]]),
+                np.array([latitude[index]]),
+            )[0])
+            if gap_m > max_gap_km * 1000.0:
+                if len(current) >= 2:
+                    segments.append(current)
+                current = []
+
+        current.append([float(longitude[index]), float(latitude[index])])
+        previous_index = index
+
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
+
+
+def write_nadir_geojson(
+    path: Path,
+    arrays: SwotArrays,
+    bbox: tuple[float, float, float, float],
+    source_file: Path,
+    variable: str,
+    value_min: float | None,
+    value_max: float | None,
+    max_gap_km: float,
+    land_shapefile: Path | None,
+    dataset_attrs: dict[str, Any],
+) -> dict[str, Any]:
+    """Write mapped SWOT nadir observations as GeoJSON LineStrings."""
+    print("\n[NADIR] Writing nadir GeoJSON")
+    if arrays.nadir_lon is None or arrays.nadir_lat is None or arrays.nadir_values is None:
+        raise ValueError(
+            "This NetCDF does not contain i_num_line/i_num_pixel, so a mapped "
+            "L3 nadir line cannot be reconstructed."
         )
 
-    print(f"Converting to Cloud Optimized GeoTIFF: {output_cog}")
+    land_geometry = None
+    if land_shapefile is not None:
+        if not land_shapefile.exists():
+            raise FileNotFoundError(land_shapefile)
+        land_geometry = load_land_geometry(land_shapefile)
+        print("Land clipping dataset:", land_shapefile)
 
-    rio_copy(
-        temp_tif,
-        output_cog,
-        driver="COG",
-        compress="deflate",
-        predictor=2,
-        blocksize=256,
-        overview_resampling="nearest",
+    valid = build_nadir_valid_mask(
+        arrays, bbox, value_min, value_max, land_geometry=land_geometry
+    )
+    segments = split_nadir_segments(
+        arrays.nadir_lon, arrays.nadir_lat, valid, max_gap_km
+    )
+    if not segments:
+        raise ValueError("No two-point nadir segments remain inside the selected bbox.")
+
+    cycle, pass_number = parse_cycle_pass_from_name(source_file)
+    common_properties = {
+        "name": "SWOT nadir track",
+        "layer_type": "nadir_track",
+        "source_file": source_file.name,
+        "source_variable": variable,
+        "source_units": arrays.units,
+        "cycle": cycle,
+        "pass": pass_number,
+        "time_start": str(dataset_attrs.get("time_coverage_start", "")),
+        "time_end": str(dataset_attrs.get("time_coverage_end", "")),
+        "land_clipped": land_shapefile is not None,
+    }
+
+    features = []
+    for segment_index, coordinates in enumerate(segments, start=1):
+        properties = dict(common_properties)
+        properties.update({
+            "segment": segment_index,
+            "point_count": len(coordinates),
+        })
+        features.append({
+            "type": "Feature",
+            "properties": properties,
+            "geometry": {
+                "type": "LineString",
+                "coordinates": coordinates,
+            },
+        })
+
+    collection = {
+        "type": "FeatureCollection",
+        "name": f"{source_file.stem}_nadir",
+        "features": features,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(collection, indent=2), encoding="utf-8")
+
+    point_count = sum(len(segment) for segment in segments)
+    print(f"Nadir segments: {len(segments)}")
+    print(f"Nadir points: {point_count}")
+    print("Saved:", path)
+    return {
+        "path": str(path.resolve()),
+        "segment_count": len(segments),
+        "point_count": point_count,
+        "land_clipped": land_shapefile is not None,
+    }
+
+
+def save_native_preview(
+    path: Path,
+    arrays: SwotArrays,
+    valid: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    variable: str,
+    display_min: float,
+    display_max: float,
+) -> None:
+    """Plot only the native KaRIn swath before regular-grid resampling.
+
+    The nadir line is deliberately omitted here so this file is a clean
+    before/after comparison of the SSHA swath itself.
+    """
+    print("\n[7/10] Saving native-swath-only diagnostic preview")
+    native = np.where(valid, arrays.values, np.nan)
+
+    fig, ax = plt.subplots(figsize=(7.2, 10.0), dpi=160)
+    mesh = ax.pcolormesh(
+        arrays.longitude, arrays.latitude, native,
+        cmap="RdBu_r", vmin=display_min, vmax=display_max,
+        shading="auto", rasterized=True,
+    )
+    west, south, east, north = bbox
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(f"Native SWOT KaRIn swath only, before resampling\n{variable}")
+    cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", pad=0.07)
+    cbar.set_label(f"{variable} ({arrays.units or 'source units'})")
+    fig.savefig(path, dpi=250, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print("Saved:", path)
+
+
+def save_resampled_preview(
+    path: Path,
+    result: RasterResult,
+    variable: str,
+    units: str,
+    display_min: float,
+    display_max: float,
+) -> None:
+    """Plot the regular raster after resampling for direct comparison."""
+    print("\n[8/10] Saving resampled-raster diagnostic preview")
+    west, south, east, north = result.bbox
+    fig, ax = plt.subplots(figsize=(7.2, 10.0), dpi=160)
+    image = ax.imshow(
+        result.data,
+        extent=(west, east, south, north),
+        origin="upper",
+        cmap="RdBu_r",
+        vmin=display_min,
+        vmax=display_max,
+        interpolation="nearest",
+        aspect="auto",
+    )
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(f"Pyresample nearest-neighbour raster\n{variable}")
+    cbar = fig.colorbar(image, ax=ax, orientation="horizontal", pad=0.07)
+    cbar.set_label(f"{variable} ({units or 'source units'})")
+    fig.savefig(path, dpi=250, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print("Saved:", path)
+
+
+def save_resampled_with_nadir_preview(
+    path: Path,
+    result: RasterResult,
+    arrays: SwotArrays,
+    variable: str,
+    units: str,
+    display_min: float,
+    display_max: float,
+    value_min: float | None,
+    value_max: float | None,
+    max_gap_km: float,
+    land_shapefile: Path | None,
+) -> None:
+    """Plot the resampled raster with the nadir track as a vector overlay.
+
+    The SSHA background comes from the COG-ready regular raster. The nadir
+    coordinates remain vector geometry and are split at invalid observations
+    and large gaps, matching the GeoJSON behavior used by the web map.
+    """
+    print("\n[9/10] Saving resampled raster with nadir overlay")
+    west, south, east, north = result.bbox
+
+    land_geometry = None
+    if land_shapefile is not None:
+        land_geometry = load_land_geometry(land_shapefile)
+
+    nadir_valid = build_nadir_valid_mask(
+        arrays, result.bbox, value_min, value_max, land_geometry
+    )
+    segments = split_nadir_segments(
+        arrays.nadir_lon if arrays.nadir_lon is not None else np.array([]),
+        arrays.nadir_lat if arrays.nadir_lat is not None else np.array([]),
+        nadir_valid,
+        max_gap_km,
     )
 
-    temp_tif.unlink(missing_ok=True)
+    fig, ax = plt.subplots(figsize=(7.2, 10.0), dpi=160)
+    image = ax.imshow(
+        result.data,
+        extent=(west, east, south, north),
+        origin="upper",
+        cmap="RdBu_r",
+        vmin=display_min,
+        vmax=display_max,
+        interpolation="nearest",
+        aspect="auto",
+    )
 
-    print(f"Saved COG: {output_cog}")
-    print("Done.")
+    for segment in segments:
+        coordinates = np.asarray(segment, dtype=float)
+        lon = coordinates[:, 0]
+        lat = coordinates[:, 1]
+
+        # Thick white casing underneath, then the thin coral dashed line.
+        ax.plot(lon, lat, color="white", linewidth=3.2, alpha=0.95, zorder=3)
+        ax.plot(
+            lon, lat, color="#ef8f73", linewidth=1.3,
+            linestyle=(0, (1.2, 2.0)), zorder=4,
+        )
+
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(f"Resampled SWOT raster with nadir vector overlay\n{variable}")
+    cbar = fig.colorbar(image, ax=ax, orientation="horizontal", pad=0.07)
+    cbar.set_label(f"{variable} ({units or 'source units'})")
+    fig.savefig(path, dpi=250, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Nadir segments plotted: {len(segments)}")
+    print("Saved:", path)
+
+
+def write_geotiff(
+    path: Path,
+    result: RasterResult,
+    variable: str,
+    units: str,
+    source_file: Path,
+    quality_values: tuple[int, ...],
+) -> None:
+    """Write the resampled raster as a tiled compressed GeoTIFF."""
+    print("\n[9/10] Writing GeoTIFF")
+    west, south, east, north = result.bbox
+    transform = from_bounds(west, south, east, north, result.width, result.height)
+    encoded = np.where(np.isfinite(result.data), result.data, NODATA).astype(np.float32)
+
+    profile = {
+        "driver": "GTiff", "height": result.height, "width": result.width,
+        "count": 1, "dtype": "float32", "crs": "EPSG:4326",
+        "transform": transform, "nodata": NODATA,
+        "compress": "DEFLATE", "predictor": 3, "tiled": True,
+        "blockxsize": 512, "blockysize": 512, "BIGTIFF": "IF_SAFER",
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(encoded, 1)
+        dst.set_band_description(1, variable)
+        dst.update_tags(
+            source_file=source_file.name,
+            source_variable=variable,
+            source_units=units,
+            processing="pyresample_nearest_neighbour",
+            estimated_source_spacing_m=f"{result.spacing_m:.3f}",
+            radius_of_influence_m=f"{result.radius_m:.3f}",
+            accepted_quality_flags=",".join(map(str, quality_values)),
+        )
+
+
+def convert_to_cog(source_tif: Path, output_cog: Path) -> None:
+    """Convert a GeoTIFF to a Cloud Optimized GeoTIFF without changing values."""
+    with rasterio.open(source_tif) as src:
+        profile = src.profile.copy()
+        profile.update(
+            driver="COG", compress="DEFLATE", predictor=3,
+            blocksize=512, overview_resampling=Resampling.nearest,
+            BIGTIFF="IF_SAFER",
+        )
+        with rasterio.open(output_cog, "w", **profile) as dst:
+            dst.write(src.read())
+            dst.update_tags(**src.tags())
+            dst.set_band_description(1, src.descriptions[0])
+
+
+def validate_raster(path: Path) -> dict[str, Any]:
+    """Reopen the written file and report geospatial and value diagnostics."""
+    print("\n[10/10] Validating written raster")
+    with rasterio.open(path) as src:
+        band = src.read(1, masked=True)
+        finite = band.compressed()
+        report = {
+            "driver": src.driver,
+            "crs": str(src.crs),
+            "width": src.width,
+            "height": src.height,
+            "bounds": [src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top],
+            "transform": list(src.transform)[:6],
+            "nodata": src.nodata,
+            "valid_output_pixels": int(finite.size),
+            "output_min": float(np.nanmin(finite)) if finite.size else None,
+            "output_max": float(np.nanmax(finite)) if finite.size else None,
+        }
+    for key, value in report.items():
+        print(f"  {key}: {value}")
+    return report
+
+
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print("Diagnostic report:", path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="Input SWOT L3 NetCDF")
+    parser.add_argument("--output", "-o", type=Path, default=None, help="Optional output .tif path. Default: save beside this script.")
+    parser.add_argument("--variable", default="ssha_unfiltered")
+    parser.add_argument("--bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+    parser.add_argument("--resolution-deg", type=float, default=0.01)
+    parser.add_argument("--radius-m", type=float, default=None)
+    parser.add_argument("--epsilon", type=float, default=0.0)
+    parser.add_argument("--quality-values", type=parse_quality_values, default=(0, 3), help="Accepted flags, default: 0,3")
+    parser.add_argument("--no-quality-mask", action="store_true")
+    parser.add_argument("--value-min", type=float, default=-2.0)
+    parser.add_argument("--value-max", type=float, default=2.0)
+    parser.add_argument("--display-min", type=float, default=-0.2)
+    parser.add_argument("--display-max", type=float, default=0.2)
+    parser.add_argument("--output-dir", type=Path, default=None, help="Optional folder for every generated file. Default: the folder containing this script.")
+    parser.add_argument("--cog", action="store_true")
+    parser.add_argument(
+        "--nadir-geojson", type=Path, default=None,
+        help="Optional nadir GeoJSON path. Default: <input>_nadir.geojson in --output-dir.",
+    )
+    parser.add_argument(
+        "--no-nadir-geojson", action="store_true",
+        help="Do not create the separate nadir vector layer.",
+    )
+    parser.add_argument(
+        "--nadir-max-gap-km", type=float, default=25.0,
+        help="Split the line when consecutive nadir observations exceed this distance.",
+    )
+    parser.add_argument(
+        "--land-shapefile", type=Path, default=None,
+        help="Optional polygon dataset used to remove nadir points over land.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.input.exists():
+        raise FileNotFoundError(args.input)
+    if args.resolution_deg <= 0:
+        raise ValueError("--resolution-deg must be positive.")
+    if args.display_min >= args.display_max:
+        raise ValueError("--display-min must be less than --display-max.")
+
+    # Keep every generated file together. By default, that is the same
+    # scripts folder that contains this Python file.
+    script_dir = Path(__file__).resolve().parent
+    output_dir = (args.output_dir or script_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    input_stem = args.input.stem
+    default_suffix = "_pyresample_cog.tif" if args.cog else "_pyresample.tif"
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else output_dir / f"{input_stem}_{args.variable}{default_suffix}"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    native_preview = output_dir / f"{input_stem}_{args.variable}_01_native_swath.png"
+    resampled_preview = output_dir / f"{input_stem}_{args.variable}_02_resampled_raster.png"
+    resampled_nadir_preview = output_dir / f"{input_stem}_{args.variable}_03_resampled_with_nadir.png"
+    report_path = output_dir / f"{input_stem}_{args.variable}_diagnostics.json"
+    nadir_geojson_path = (
+        args.nadir_geojson.expanduser().resolve()
+        if args.nadir_geojson is not None
+        else output_dir / f"{input_stem}_nadir.geojson"
+    )
+
+    ds = open_swot_dataset(args.input)
+    try:
+        inventory = inspect_dataset(ds, args.variable)
+        arrays = load_native_arrays(ds, args.variable)
+        source_valid = build_valid_mask(
+            arrays, args.quality_values, not args.no_quality_mask,
+            args.value_min, args.value_max,
+        )
+        bbox = normalize_bbox(args.bbox) if args.bbox else derive_bbox(
+            arrays.longitude, arrays.latitude, source_valid
+        )
+        clipped_valid = apply_bbox_mask(arrays.longitude, arrays.latitude, source_valid, bbox)
+
+        save_native_preview(
+            native_preview, arrays, clipped_valid, bbox, args.variable,
+            args.display_min, args.display_max,
+        )
+
+        result = resample_swath_nearest(
+            arrays, clipped_valid, bbox, args.resolution_deg,
+            args.radius_m, args.epsilon,
+        )
+
+        save_resampled_preview(
+            resampled_preview, result, args.variable, arrays.units,
+            args.display_min, args.display_max,
+        )
+
+        save_resampled_with_nadir_preview(
+            resampled_nadir_preview, result, arrays, args.variable, arrays.units,
+            args.display_min, args.display_max,
+            args.value_min, args.value_max, args.nadir_max_gap_km,
+            args.land_shapefile,
+        )
+
+        if args.cog:
+            with tempfile.TemporaryDirectory(prefix="swot_cog_") as temp_dir:
+                intermediate = Path(temp_dir) / "intermediate.tif"
+                write_geotiff(
+                    intermediate, result, args.variable, arrays.units,
+                    args.input, args.quality_values,
+                )
+                convert_to_cog(intermediate, output_path)
+        else:
+            write_geotiff(
+                output_path, result, args.variable, arrays.units,
+                args.input, args.quality_values,
+            )
+
+        raster_report = validate_raster(output_path)
+
+        nadir_report = None
+        if not args.no_nadir_geojson:
+            nadir_report = write_nadir_geojson(
+                nadir_geojson_path, arrays, bbox, args.input, args.variable,
+                args.value_min, args.value_max, args.nadir_max_gap_km,
+                args.land_shapefile, dict(ds.attrs),
+            )
+
+        report = {
+            "input": str(args.input.resolve()),
+            "output": str(output_path.resolve()),
+            "variable": args.variable,
+            "source_units": arrays.units,
+            "dataset_inventory": inventory,
+            "accepted_quality_flags": list(args.quality_values),
+            "quality_mask_enabled": not args.no_quality_mask,
+            "source_valid_pixels_before_bbox": int(source_valid.sum()),
+            "source_valid_pixels_inside_bbox": int(clipped_valid.sum()),
+            "bbox": list(bbox),
+            "requested_resolution_deg": args.resolution_deg,
+            "estimated_source_spacing_m": result.spacing_m,
+            "radius_of_influence_m": result.radius_m,
+            "native_preview": str(native_preview.resolve()),
+            "resampled_preview": str(resampled_preview.resolve()),
+            "resampled_nadir_preview": str(resampled_nadir_preview.resolve()),
+            "raster_validation": raster_report,
+            "nadir_geojson": nadir_report,
+        }
+        write_report(report_path, report)
+    finally:
+        ds.close()
 
 
 if __name__ == "__main__":

@@ -1,239 +1,288 @@
 #!/usr/bin/env python3
+"""Build one lightweight GeoJSON catalog of full SWOT pass tracks.
+
+The catalog is the first layer loaded by the React-Leaflet map. Each pass is
+one GeoJSON feature. The feature properties contain the browser URLs for that
+pass's nadir GeoJSON and SSHA COG, but those larger detail files are not loaded
+until the user clicks the pass.
+
+Example for all NetCDF files in one folder:
+
+    python scripts/swot_to_geojson.py \
+      ~/Documents/MOSAICS-2026/SWOT-Data/*.nc \
+      --output frontend/public/data/swot_full_tracks.geojson \
+      --stride 10
+
+The shell expands ``*.nc`` into multiple input paths. A stride of 10 keeps the
+world-scale orbit lines light enough for the browser while preserving their
+shape. It does not affect the scientific COG data.
 """
-swot_to_geojson.py
 
-Purpose:
-    Convert one SWOT NetCDF file into a GeoJSON file that can be displayed
-    on a web map, such as React Leaflet or MMGIS.
-
-Input:
-    A SWOT L3 LR SSH Expert NetCDF file, for example:
-    SWOT_L3_LR_SSH_Expert_013_147_20240401T194600_20240401T203727_v3.0.nc
-
-Output:
-    A GeoJSON file, for example:
-    outputs/swot_pass_147_full_track.geojson
-
-What the GeoJSON contains:
-    One LineString feature representing the full SWOT pass track.
-
-Important:
-    This first version does NOT visualize SSHA values yet.
-    It only extracts the latitude/longitude track from the NetCDF.
-    Later, we can add:
-        - Gulf Stream clipping
-        - swath edge outlines
-        - full swath polygons
-        - SSHA raster/image export
-        - popup metadata
-"""
+from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import xarray as xr
 
+PASS_PATTERN = re.compile(
+    r"_(?P<cycle>\d{3})_(?P<pass>\d{3})_"
+    r"(?P<start>\d{8}T\d{6})_(?P<end>\d{8}T\d{6})_"
+)
 
-def lon_360_to_180(lon):
+
+def wrap_longitudes(longitude: np.ndarray) -> np.ndarray:
+    """Convert longitudes to Leaflet's expected [-180, 180) range."""
+    return ((longitude + 180.0) % 360.0) - 180.0
+
+
+def circular_mean_longitude(longitudes: np.ndarray) -> float:
+    """Average longitude correctly when source points approach the dateline."""
+    radians = np.deg2rad(longitudes)
+    mean_sin = np.mean(np.sin(radians))
+    mean_cos = np.mean(np.cos(radians))
+    return float(np.rad2deg(np.arctan2(mean_sin, mean_cos)))
+
+
+def parse_filename_metadata(path: Path) -> dict[str, str]:
+    """Read cycle, pass, and file timestamps from a standard SWOT filename."""
+    match = PASS_PATTERN.search(path.name)
+    if not match:
+        raise ValueError(
+            "Could not find cycle/pass/timestamps in filename: "
+            f"{path.name}"
+        )
+    return match.groupdict()
+
+
+def extract_centerline(ds: xr.Dataset, stride: int) -> list[list[float]]:
+    """Extract a lightweight centerline from the native 2-D SWOT swath.
+
+    A circular longitude mean avoids the false center produced by a regular
+    arithmetic mean near ±180 degrees. ``stride`` only simplifies the overview
+    line; the nadir and COG retain their own full detail.
     """
-    Convert longitude values from 0–360 format to -180–180 format.
+    longitude = wrap_longitudes(
+        np.asarray(ds["longitude"].values, dtype=np.float64)
+    )
+    latitude = np.asarray(ds["latitude"].values, dtype=np.float64)
 
-    Why this matters:
-        Some satellite datasets store longitude from 0 to 360 degrees.
-        Example:
-            279 degrees = -81 degrees
-            353 degrees = -7 degrees
+    if longitude.shape != latitude.shape or longitude.ndim != 2:
+        raise ValueError(
+            "longitude and latitude must be matching 2-D arrays; got "
+            f"{longitude.shape} and {latitude.shape}."
+        )
 
-        Web maps like Leaflet usually expect longitude from -180 to 180.
+    coordinates: list[list[float]] = []
 
-    Formula:
-        ((lon + 180) % 360) - 180
+    for row_index in range(0, longitude.shape[0], stride):
+        row_lon = longitude[row_index]
+        row_lat = latitude[row_index]
+        valid = (
+            np.isfinite(row_lon)
+            & np.isfinite(row_lat)
+            & (row_lat >= -90.0)
+            & (row_lat <= 90.0)
+        )
 
-    Input:
-        lon: NumPy array of longitude values
-
-    Output:
-        NumPy array of converted longitude values
-    """
-    return ((lon + 180) % 360) - 180
-
-
-def extract_pass_line(ds):
-    """
-    Extract an approximate centerline by averaging valid SWOT swath pixels
-    across each along-track row.
-
-    This works better than choosing one middle pixel column because SWOT has
-    a nadir gap and two KaRIn swaths.
-    """
-    lat = ds["latitude"].values
-    lon = ds["longitude"].values
-
-    lon = lon_360_to_180(lon)
-
-    coords = []
-
-    for row_lon, row_lat in zip(lon, lat):
-        valid = np.isfinite(row_lon) & np.isfinite(row_lat)
-
-        if np.sum(valid) < 2:
+        if np.count_nonzero(valid) < 2:
             continue
 
-        center_lon = float(np.nanmean(row_lon[valid]))
-        center_lat = float(np.nanmean(row_lat[valid]))
+        coordinates.append(
+            [
+                circular_mean_longitude(row_lon[valid]),
+                float(np.mean(row_lat[valid])),
+            ]
+        )
 
-        coords.append([center_lon, center_lat])
+    # Always retain the final valid row so the overview reaches the pass end.
+    final_lon = longitude[-1]
+    final_lat = latitude[-1]
+    final_valid = (
+        np.isfinite(final_lon)
+        & np.isfinite(final_lat)
+        & (final_lat >= -90.0)
+        & (final_lat <= 90.0)
+    )
+    if np.count_nonzero(final_valid) >= 2:
+        final_coordinate = [
+            circular_mean_longitude(final_lon[final_valid]),
+            float(np.mean(final_lat[final_valid])),
+        ]
+        if not coordinates or final_coordinate != coordinates[-1]:
+            coordinates.append(final_coordinate)
 
-    if len(coords) < 2:
-        raise ValueError("Not enough valid points to make a GeoJSON line.")
+    if len(coordinates) < 2:
+        raise ValueError("Not enough valid rows to construct a pass line.")
 
-    return coords
+    return coordinates
 
 
-def build_geojson_feature(nc_path, ds, coords, pass_num=None, cycle=None):
+def split_at_antimeridian(
+    coordinates: list[list[float]],
+) -> list[list[list[float]]]:
+    """Split a line where longitude jumps across ±180 degrees.
+
+    Without this split, Leaflet can draw an incorrect horizontal line across
+    the entire world when a pass crosses the antimeridian.
     """
-    Build a GeoJSON FeatureCollection from the extracted pass line.
+    segments: list[list[list[float]]] = []
+    current: list[list[float]] = [coordinates[0]]
 
-    A GeoJSON FeatureCollection is the format Leaflet can load.
+    for previous, coordinate in zip(coordinates, coordinates[1:]):
+        if abs(coordinate[0] - previous[0]) > 180.0:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [coordinate]
+        else:
+            current.append(coordinate)
 
-    Structure:
-        FeatureCollection
-            Feature
-                properties = metadata shown in popups later
-                geometry = LineString coordinates
+    if len(current) >= 2:
+        segments.append(current)
 
-    Input:
-        nc_path: path to the NetCDF file
-        ds: xarray Dataset
-        coords: list of [longitude, latitude] points
-        pass_num: optional SWOT pass number, like 147
-        cycle: optional SWOT cycle number, like 013
+    if not segments:
+        raise ValueError("Antimeridian splitting removed every line segment.")
 
-    Output:
-        GeoJSON dictionary
-    """
+    return segments
 
-    # This is one map feature: the SWOT pass line.
-    feature = {
+
+def line_geometry(segments: list[list[list[float]]]) -> dict[str, Any]:
+    """Use LineString for one segment or MultiLineString for a dateline pass."""
+    if len(segments) == 1:
+        return {"type": "LineString", "coordinates": segments[0]}
+    return {"type": "MultiLineString", "coordinates": segments}
+
+
+def build_feature(
+    nc_path: Path,
+    ds: xr.Dataset,
+    stride: int,
+    browser_data_prefix: str,
+    variable: str,
+) -> dict[str, Any]:
+    """Create one catalog feature for one SWOT NetCDF pass."""
+    metadata = parse_filename_metadata(nc_path)
+    cycle = metadata["cycle"]
+    pass_number = metadata["pass"]
+    pass_id = f"{cycle}-{pass_number}"
+
+    coordinates = extract_centerline(ds, stride=stride)
+    segments = split_at_antimeridian(coordinates)
+
+    prefix = browser_data_prefix.rstrip("/")
+    base_name = f"swot_cycle_{cycle}_pass_{pass_number}"
+
+    return {
         "type": "Feature",
         "properties": {
-            # These properties can be shown in a Leaflet popup later.
-            "name": "SWOT Pass Line",
+            "id": pass_id,
+            "name": f"SWOT Cycle {cycle} · Pass {pass_number}",
             "source_file": nc_path.name,
-            "pass": pass_num,
             "cycle": cycle,
-
-            # These come from the NetCDF global attributes.
-            "time_start": str(ds.attrs.get("time_coverage_start", "")),
-            "time_end": str(ds.attrs.get("time_coverage_end", "")),
-            "product": ds.attrs.get("title", "SWOT L3 LR SSH Expert"),
-            "doi": ds.attrs.get("doi", ""),
+            "pass": pass_number,
+            "time_start": str(
+                ds.attrs.get("time_coverage_start", metadata["start"])
+            ),
+            "time_end": str(
+                ds.attrs.get("time_coverage_end", metadata["end"])
+            ),
+            "product": str(
+                ds.attrs.get("title", "SWOT L3 LR SSH Expert")
+            ),
+            "variable": variable,
+            "nadir_url": f"{prefix}/{base_name}_nadir.geojson",
+            "cog_url": f"{prefix}/{base_name}_{variable}_cog.tif",
         },
-        "geometry": {
-            "type": "LineString",
-            "coordinates": coords,
-        },
+        "geometry": line_geometry(segments),
     }
 
-    # GeoJSON files usually contain a FeatureCollection, even if there is
-    # only one feature.
-    geojson = {
-        "type": "FeatureCollection",
-        "features": [feature],
-    }
 
-    return geojson
-
-
-def main():
-    """
-    Main command-line function.
-
-    This lets you run the script like:
-
-        python scripts/swot_to_geojson.py input_file.nc --output output.geojson
-
-    It:
-        1. Reads command-line arguments
-        2. Opens the NetCDF file
-        3. Extracts the SWOT pass line
-        4. Builds GeoJSON
-        5. Saves the GeoJSON file
-    """
-
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert a SWOT NetCDF pass track to GeoJSON."
+        description="Build a GeoJSON catalog containing multiple SWOT pass tracks."
     )
-
-    # Required input NetCDF file.
     parser.add_argument(
-        "file",
-        help="Path to SWOT NetCDF file.",
+        "files",
+        nargs="+",
+        help="One or more SWOT NetCDF files. Shell wildcards are supported.",
     )
-
-    # Optional output path.
-    # If not provided, it saves to outputs/swot_pass_line.geojson.
     parser.add_argument(
         "--output",
-        default="outputs/swot_pass_line.geojson",
-        help="Output GeoJSON path.",
+        default="frontend/public/data/swot_full_tracks.geojson",
+        help="Output catalog GeoJSON path.",
     )
-
-    # Optional metadata: pass number.
     parser.add_argument(
-        "--pass-num",
-        default=None,
-        help="SWOT pass number, e.g. 147.",
+        "--stride",
+        type=int,
+        default=10,
+        help="Keep every Nth along-track row for the lightweight overview line.",
     )
-
-    # Optional metadata: cycle number.
     parser.add_argument(
-        "--cycle",
-        default=None,
-        help="SWOT cycle number, e.g. 013.",
+        "--browser-data-prefix",
+        default="/data",
+        help="Browser URL prefix used for companion nadir and COG files.",
     )
-
+    parser.add_argument(
+        "--variable",
+        default="ssha_unfiltered",
+        help="Variable name included in companion COG filenames.",
+    )
     args = parser.parse_args()
 
-    # Convert file paths into absolute paths.
-    nc_path = Path(args.file).expanduser().resolve()
+    if args.stride < 1:
+        raise ValueError("--stride must be at least 1.")
+
+    input_paths = sorted(
+        {Path(value).expanduser().resolve() for value in args.files}
+    )
     output_path = Path(args.output).expanduser().resolve()
-
-    # Stop early if the NetCDF file does not exist.
-    if not nc_path.exists():
-        raise FileNotFoundError(f"File not found: {nc_path}")
-
-    # Make the output folder if it does not exist.
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Opening NetCDF: {nc_path}")
+    features: list[dict[str, Any]] = []
 
-    # Open the SWOT NetCDF file with xarray.
-    ds = xr.open_dataset(nc_path)
+    for index, nc_path in enumerate(input_paths, start=1):
+        if not nc_path.exists():
+            print(f"Skipping missing file: {nc_path}")
+            continue
 
-    # Extract the full pass line coordinates.
-    coords = extract_pass_line(ds)
+        print(f"[{index}/{len(input_paths)}] Reading {nc_path.name}")
+        with xr.open_dataset(
+            nc_path,
+            mask_and_scale=True,
+            decode_times=False,
+        ) as ds:
+            features.append(
+                build_feature(
+                    nc_path=nc_path,
+                    ds=ds,
+                    stride=args.stride,
+                    browser_data_prefix=args.browser_data_prefix,
+                    variable=args.variable,
+                )
+            )
 
-    # Build the GeoJSON object.
-    geojson = build_geojson_feature(
-        nc_path=nc_path,
-        ds=ds,
-        coords=coords,
-        pass_num=args.pass_num,
-        cycle=args.cycle,
-    )
+    if not features:
+        raise ValueError("No valid SWOT pass features were created.")
 
-    # Write the GeoJSON dictionary to a .geojson file.
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(geojson, f, indent=2)
+    catalog = {
+        "type": "FeatureCollection",
+        "properties": {
+            "name": "SWOT Full Pass Track Catalog",
+            "feature_count": len(features),
+            "overview_stride": args.stride,
+        },
+        "features": features,
+    }
 
-    print(f"Saved GeoJSON: {output_path}")
-    print(f"Number of line points: {len(coords)}")
-    print("Done.")
+    with output_path.open("w", encoding="utf-8") as output_file:
+        json.dump(catalog, output_file, indent=2)
+
+    print(f"Saved {len(features)} pass tracks to: {output_path}")
 
 
-# This makes sure main() runs when you execute the file directly.
 if __name__ == "__main__":
     main()

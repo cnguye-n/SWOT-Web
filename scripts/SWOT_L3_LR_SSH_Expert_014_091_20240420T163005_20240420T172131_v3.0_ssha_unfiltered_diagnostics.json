@@ -1,0 +1,117 @@
+{
+  "input": "/home/ctnguyen/Documents/MOSAICS-2026/SWOT-Web/scripts/SWOT_L3_LR_SSH_Expert_014_091_20240420T163005_20240420T172131_v3.0.nc",
+  "output": "/home/ctnguyen/Documents/MOSAICS-2026/SWOT-Web/scripts/SWOT_L3_LR_SSH_Expert_014_091_20240420T163005_20240420T172131_v3.0_ssha_unfiltered_pyresample_cog.tif",
+  "variable": "ssha_unfiltered",
+  "source_units": "m",
+  "dataset_inventory": {
+    "dimensions": {
+      "num_lines": 9860,
+      "num_pixels": 69,
+      "num_nadir": 1557
+    },
+    "variables": {
+      "longitude": {
+        "shape": [
+          9860,
+          69
+        ],
+        "dtype": "float64",
+        "units": "degrees_east"
+      },
+      "latitude": {
+        "shape": [
+          9860,
+          69
+        ],
+        "dtype": "float64",
+        "units": "degrees_north"
+      },
+      "ssha_unfiltered": {
+        "shape": [
+          9860,
+          69
+        ],
+        "dtype": "float64",
+        "units": "m"
+      },
+      "quality_flag": {
+        "shape": [
+          9860,
+          69
+        ],
+        "dtype": "uint8",
+        "units": "1"
+      },
+      "cross_track_distance": {
+        "shape": [
+          69
+        ],
+        "dtype": "float64",
+        "units": "km"
+      },
+      "i_num_line": {
+        "shape": [
+          1557
+        ],
+        "dtype": "int16",
+        "units": "count"
+      },
+      "i_num_pixel": {
+        "shape": [
+          1557
+        ],
+        "dtype": "int8",
+        "units": "count"
+      },
+      "time": {
+        "shape": [
+          9860
+        ],
+        "dtype": "float64",
+        "units": "seconds since 2000-01-01 00:00:00.0"
+      }
+    }
+  },
+  "accepted_quality_flags": [
+    0,
+    3
+  ],
+  "quality_mask_enabled": true,
+  "source_valid_pixels_before_bbox": 304183,
+  "source_valid_pixels_inside_bbox": 304183,
+  "bbox": [
+    -119.14641199999998,
+    -70.289734,
+    -1.462185000000045,
+    78.267468
+  ],
+  "requested_resolution_deg": 0.01,
+  "estimated_source_spacing_m": 1997.0827257718238,
+  "radius_of_influence_m": 2995.6240886577357,
+  "native_preview": "/home/ctnguyen/Documents/MOSAICS-2026/SWOT-Web/scripts/SWOT_L3_LR_SSH_Expert_014_091_20240420T163005_20240420T172131_v3.0_ssha_unfiltered_01_native_swath.png",
+  "resampled_preview": "/home/ctnguyen/Documents/MOSAICS-2026/SWOT-Web/scripts/SWOT_L3_LR_SSH_Expert_014_091_20240420T163005_20240420T172131_v3.0_ssha_unfiltered_02_resampled_raster.png",
+  "raster_validation": {
+    "driver": "GTiff",
+    "crs": "EPSG:4326",
+    "width": 11769,
+    "height": 14856,
+    "bounds": [
+      -119.14641199999998,
+      -70.289734,
+      -1.4621850000000478,
+      78.267468
+    ],
+    "transform": [
+      0.009999509474041969,
+      0.0,
+      -119.14641199999998,
+      0.0,
+      -0.009999811658589122,
+      78.267468
+    ],
+    "nodata": -9999.0,
+    "valid_output_pixels": 1346413,
+    "output_min": -0.35499998927116394,
+    "output_max": 0.5101000070571899
+  }
+}

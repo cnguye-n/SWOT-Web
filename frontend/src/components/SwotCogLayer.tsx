@@ -1,4 +1,3 @@
-// @ts-ignore
 import { useEffect } from "react";
 import { useMap } from "react-leaflet";
 import parseGeoraster from "georaster";
@@ -6,217 +5,193 @@ import GeoRasterLayer from "georaster-layer-for-leaflet";
 import chroma from "chroma-js";
 
 /**
- * Props for the SWOT COG layer.
+ * Cache already-opened COGs.
  *
- * url is the path to the Cloud Optimized GeoTIFF file.
- * Example:
- * /data/swot_pass_91_gulf_stream_ssha_unfiltered_cog.tif
+ * When the user hides and reopens the same pass,
+ * the file metadata does not need to be parsed again.
  */
+const georasterCache = new Map<string, Promise<any>>();
+
+async function getGeoraster(url: string): Promise<any> {
+  const cached = georasterCache.get(url);
+
+  if (cached) {
+    return cached;
+  }
+
+  /**
+   * Passing the URL directly lets GeoRaster treat the file as a COG
+   * and request raster sections as needed.
+   *
+   * The old code used:
+   * fetch -> arrayBuffer -> parseGeoraster
+   *
+   * That required downloading the complete TIFF before displaying it.
+   */
+  const request = parseGeoraster(url).catch((error: unknown) => {
+    georasterCache.delete(url);
+    throw error;
+  });
+
+  georasterCache.set(url, request);
+  return request;
+}
+
 type SwotCogLayerProps = {
+  /** Browser path such as /data/pass_091.tif */
   url: string;
+
+  /** Leaflet pane where the raster should be drawn */
+  pane?: string;
+
+  /** SSHA display range in meters */
+  displayMin?: number;
+  displayMax?: number;
+
+  /**
+   * Number of raster samples rendered across and down
+   * each Leaflet tile.
+   */
+  renderResolution?: number;
+
+  opacity?: number;
+
+  /** Move the map to the COG bounds when it opens */
+  fitBounds?: boolean;
 };
 
-export default function SwotCogLayer({ url }: SwotCogLayerProps) {
-  /**
-   * useMap() gives this component access to the Leaflet map object.
-   * We need this so we can manually add and remove the raster layer.
-   */
+export default function SwotCogLayer({
+  url,
+  pane = "overlayPane",
+  displayMin = -0.2,
+  displayMax = 0.2,
+  renderResolution = 128,
+  opacity = 0.9,
+  fitBounds = true,
+}: SwotCogLayerProps) {
   const map = useMap();
 
   useEffect(() => {
-    /**
-     * layer stores the GeoRasterLayer after it is created.
-     * We keep a reference so we can remove it when the component unmounts
-     * or when the URL changes.
-     */
-    let layer: any;
-
-    /**
-     * cancelled prevents the code from adding a layer after the component
-     * has already unmounted. This avoids weird bugs if the COG is still
-     * loading while the user switches layers.
-     */
+    let layer: any = null;
     let cancelled = false;
 
     async function loadCog() {
+      if (!(displayMin < 0 && displayMax > 0)) {
+        throw new Error(
+          "The SSHA display range must cross zero, such as -0.2 to 0.2."
+        );
+      }
+
       console.log("Loading SWOT COG:", url);
 
-      /**
-       * Fetch the COG from the public folder.
-       *
-       * In React/Vite, a file stored at:
-       * frontend/public/data/example.tif
-       *
-       * is available in the browser as:
-       * /data/example.tif
-       */
-      const response = await fetch(url);
+      const georaster = await getGeoraster(url);
 
-      if (!response.ok) {
-        throw new Error(`Failed to load COG: ${url}`);
+      if (cancelled) {
+        return;
       }
 
       /**
-       * Convert the downloaded file into an ArrayBuffer.
-       * parseGeoraster needs the raw binary data from the GeoTIFF/COG.
-       */
-      const arrayBuffer = await response.arrayBuffer();
-
-      /**
-       * Parse the GeoTIFF/COG into a georaster object.
-       * This object contains:
-       * - raster values
-       * - bounds
-       * - projection/georeferencing info
-       * - width/height
-       */
-      const georaster = await parseGeoraster(arrayBuffer);
-
-      /**
-       * If the component unmounted while the file was loading,
-       * stop here and do not add anything to the map.
-       */
-      if (cancelled) return;
-
-      /**
-       * Matt Archer Figure 1 style uses caxis([-0.4, 0.4]).
+       * Five-color diverging SSHA scale:
        *
-       * The SWOT SSHA values are in meters:
-       * -0.4 m = -40 cm
-       *  0.0 m = 0 cm
-       * +0.4 m = +40 cm
-       *
-       * This range controls the DISPLAY colors only.
-       * It does not change the actual SSHA data.
+       * -0.20 m = dark blue
+       * -0.10 m = light blue
+       *  0.00 m = white
+       * +0.10 m = orange
+       * +0.20 m = dark red
        */
-      const COLOR_MIN = -0.4;
-      const COLOR_MAX = 0.4;
+      const negativeMidpoint = displayMin / 2;
+      const positiveMidpoint = displayMax / 2;
 
-      /**
-       * Diverging SSHA color ramp:
-       *
-       * -40 cm   dark blue
-       * -20 cm   light blue
-       *   0 cm   white
-       * +20 cm   orange
-       * +40 cm   dark red
-       *
-       * This is good for SSHA because zero is meaningful:
-       * negative anomaly = blue
-       * positive anomaly = red
-       */
       const colorScale = chroma
-        .scale(["#2166ac", "#67a9cf", "#f7f7f7", "#ef8a62", "#b2182b"])
-        .domain([COLOR_MIN, -0.2, 0, 0.2, COLOR_MAX]);
+        .scale([
+          "#2166ac",
+          "#67a9cf",
+          "#f7f7f7",
+          "#ef8a62",
+          "#b2182b",
+        ])
+        .domain([
+          displayMin,
+          negativeMidpoint,
+          0,
+          positiveMidpoint,
+          displayMax,
+        ]);
 
-      /**
-       * Create the Leaflet raster layer.
-       *
-       * GeoRasterLayer takes the numeric COG values and draws them on the map.
-       * The pixelValuesToColorFn below tells it how to color each pixel.
-       */
-      layer = new GeoRasterLayer({
+      layer = new (GeoRasterLayer as any)({
         georaster,
 
         /**
-         * Opacity controls transparency.
-         * 1.0 = fully opaque
-         * 0.0 = fully transparent
-         *
-         * 0.85 keeps the SSHA strong while still letting some basemap show.
+         * Draw the raster below the pass and nadir vectors.
          */
-        opacity: 0.85,
+        pane,
+
+        opacity,
 
         /**
-         * Rendering resolution for the browser display.
-         *
-         * Higher number = sharper but slower.
-         * Lower number = faster but coarser.
-         *
-         * This does NOT create real scientific resolution.
-         * The actual science resolution depends on the source SWOT product
-         * and the Python rasterization step.
+         * Browser rendering resolution only.
+         * It does not change the scientific resolution of the COG.
          */
-        resolution: 256,
+        resolution: renderResolution,
 
         /**
-         * This function is called for each raster pixel.
-         * It receives the raster value and returns a color.
-         *
-         * For a single-band SSHA COG, values[0] is the SSHA value in meters.
+         * Do not blend neighboring values.
          */
+        resampleMethod: "nearest",
+
+        /**
+         * Wait until map movement finishes before redrawing.
+         */
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+
+        /**
+         * Keep only a small number of off-screen tiles.
+         */
+        keepBuffer: 2,
+
+        debugLevel: 0,
+
         pixelValuesToColorFn: (values: number[]) => {
           const value = values[0];
 
-          /**
-           * Missing values should be transparent.
-           * Returning null means "do not draw this pixel."
-           */
-          if (value === null || value === undefined || Number.isNaN(value)) {
+          if (
+            value === null ||
+            value === undefined ||
+            Number.isNaN(value) ||
+            value <= -9998
+          ) {
             return null;
           }
 
           /**
-           * Our COG uses -9999 as nodata.
-           * Anything around that value should not be drawn.
-           */
-          if (value <= -9998) {
-            return null;
-          }
-
-          /**
-           * Clamp extreme values into the display range.
-           *
-           * Example:
-           * If value = 0.7 m, we color it like 0.4 m.
-           * If value = -0.9 m, we color it like -0.4 m.
-           *
-           * This prevents extreme outliers from breaking the color ramp.
-           * It only affects color display, not the original data file.
+           * Values beyond ±0.2 m receive the endpoint color.
+           * This affects display only, not stored SSHA values.
            */
           const clampedValue = Math.max(
-            COLOR_MIN,
-            Math.min(COLOR_MAX, value)
+            displayMin,
+            Math.min(displayMax, value)
           );
 
-          /**
-           * Convert the numeric SSHA value into a hex color.
-           */
           return colorScale(clampedValue).hex();
         },
       });
 
-      /**
-       * Add the COG layer to the Leaflet map.
-       */
       layer.addTo(map);
 
-      /**
-       * Zoom/pan the map to the bounds of the COG.
-       * This is helpful while testing because it automatically jumps to the swath.
-       */
-      map.fitBounds(layer.getBounds());
+      if (fitBounds) {
+        map.fitBounds(layer.getBounds(), {
+          padding: [20, 20],
+        });
+      }
 
       console.log("SWOT COG loaded.");
     }
 
-    /**
-     * Start loading the COG.
-     * If something fails, print the error in the browser console.
-     */
     loadCog().catch((error) => {
       console.error("Error loading SWOT COG:", error);
     });
 
-    /**
-     * Cleanup function.
-     *
-     * React calls this when:
-     * - the component unmounts
-     * - the url changes
-     *
-     * It prevents duplicate COG layers from stacking on the map.
-     */
     return () => {
       cancelled = true;
 
@@ -224,11 +199,16 @@ export default function SwotCogLayer({ url }: SwotCogLayerProps) {
         map.removeLayer(layer);
       }
     };
-  }, [map, url]);
+  }, [
+    map,
+    url,
+    pane,
+    displayMin,
+    displayMax,
+    renderResolution,
+    opacity,
+    fitBounds,
+  ]);
 
-  /**
-   * This component does not render normal HTML.
-   * It only adds a Leaflet layer to the map.
-   */
   return null;
 }
